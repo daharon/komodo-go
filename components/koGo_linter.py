@@ -1,25 +1,25 @@
 # ***** BEGIN LICENSE BLOCK *****
 # Version: MPL 1.1/GPL 2.0/LGPL 2.1
-# 
+#
 # The contents of this file are subject to the Mozilla Public License
 # Version 1.1 (the "License"); you may not use this file except in
 # compliance with the License. You may obtain a copy of the License at
 # http://www.mozilla.org/MPL/
-# 
+#
 # Software distributed under the License is distributed on an "AS IS"
 # basis, WITHOUT WARRANTY OF ANY KIND, either express or implied. See the
 # License for the specific language governing rights and limitations
 # under the License.
-# 
+#
 # The Original Code is Komodo code.
-# 
+#
 # The Initial Developer of the Original Code is ActiveState Software Inc.
 # Portions created by ActiveState Software Inc are Copyright (C) 2000-2007
 # ActiveState Software Inc. All Rights Reserved.
-# 
+#
 # Contributor(s):
 #   ActiveState Software Inc
-# 
+#
 # Alternatively, the contents of this file may be used under the terms of
 # either the GNU General Public License Version 2 or later (the "GPL"), or
 # the GNU Lesser General Public License Version 2.1 or later (the "LGPL"),
@@ -31,7 +31,7 @@
 # and other provisions required by the GPL or the LGPL. If you do not delete
 # the provisions above, a recipient may use your version of this file under
 # the terms of any one of the MPL, the GPL or the LGPL.
-# 
+#
 # ***** END LICENSE BLOCK *****
 
 # Komodo Go language service.
@@ -50,7 +50,7 @@ from koLintResult import KoLintResult
 from koLintResults import koLintResults
 
 log = logging.getLogger("koGoLanguage")
-#log.setLevel(logging.DEBUG)
+log.setLevel(logging.INFO)
 
 
 class KoGoLinter(object):
@@ -76,64 +76,92 @@ class KoGoLinter(object):
             log.error('"go" binary not found.')
 
     def lint(self, request):
-        log.info(request)
+        log.debug("Request: [%s]", request)
         encoding_name = request.encoding.python_encoding_name
         text = request.content.encode(encoding_name)
         return self.lint_with_text(request, text)
 
     def lint_with_text(self, request, text):
-        log.info(request)
-        log.debug(text)
+        log.debug("Request: [%s]", request)
+        log.debug("Text: [%s]", text)
         if not text.strip():
             return None
         # consider adding lint preferences? maybe for compiler selection, paths, etc?
 
         # Save the current buffer to a temporary file.
-        _, source_filename = tempfile.mkstemp(prefix='~kogo', suffix='.go', dir=request.cwd)
-        _, dest_filename = tempfile.mkstemp()
-        source_file_shortname = os.path.basename(source_filename)
+        env = koprocessutils.getUserEnv()
+        results = koLintResults()
 
-        compilation_command = ['go', 'build', '-o', dest_filename, source_file_shortname]
         try:
-            temp_source_file = open(source_filename, 'w')
+            temp_source_file = tempfile.NamedTemporaryFile(prefix='kogo', suffix='.go', delete=False)
+            temp_dest_file = tempfile.NamedTemporaryFile(delete=False)
+            temp_dest_file.close()
+            compilation_command = ['go', 'build', '-o', temp_dest_file.name, temp_source_file.name]
+
             temp_source_file.write(text)
             temp_source_file.close()
-            env = koprocessutils.getUserEnv()
-            results = koLintResults()
 
             log.info('Running ' + ' '.join(compilation_command))
-            p = process.ProcessOpen(compilation_command, cwd=request.cwd, env=env, stdin=None)
-            output, error = p.communicate()
-            log.debug("output: output:[%s], error:[%s]", output, error)
+            p = process.ProcessOpen(compilation_command, env=env, stdin=None)
+            output_text, error_text = p.communicate()
+            log.debug("Output: output:[%s], error:[%s]", output_text, error_text)
             retval = p.returncode
+        except (OSError, IOError) as e:
+            log.error(str(e))
+        else:
+            log.debug("Return value: [%d]", retval)
+            result_builders = {
+                1: {'input': error_text, 'func': self._build_error_result, 'start': 0},
+                2: {'input': output_text, 'func': self._build_output_result, 'start': 1}
+            }
+            if retval in result_builders.keys():
+                if result_builders[retval]['input']:
+                    output = result_builders[retval]['input'].replace(temp_source_file.name, request.koDoc.baseName)
+
+                    for line in output.splitlines()[result_builders[retval]['start']:]:
+                        log.debug("Error line: [%s]", line)
+                        results.addResult(result_builders[retval]['func'](text, line, request.koDoc.baseName))
+                else:
+                    r = KoLintResult()
+                    r.severity = r.SEV_ERROR
+                    r.description = 'Unexpected error'
+                    results.addResult(r)
         finally:
-            os.unlink(source_filename)
+            os.unlink(temp_source_file.name)
             try:
-                os.unlink(dest_filename)
+                os.unlink(temp_dest_file.name)
             except OSError:
-                pass
-        if retval != 0:
-            if output:
-                output = output.replace(source_file_shortname, request.koDoc.baseName)
-                for line in output.splitlines()[1:]:
-                    results.addResult(self._buildResult(text, line, request.koDoc.baseName))
-            else:
-                    results.addResult(self._buildResult(text, "Unexpected error"))
+                pass    # No output file was created.
+        log.debug("results: [%s]" , results)
         return results
 
-    def _buildResult(self, text, message, filename=None):
+    def _build_output_result(self, text, message, filename):
+        # Example message:  hello.go:9: imported and not used: "time"
         r = KoLintResult()
         r.severity = r.SEV_ERROR
-        r.description = message
-        
-        m = re.match('./%s:(\d+): (.*)' % filename or '', message)
+        m = re.match('%s:(?P<line_no>\d+): (?P<message>.*)' % re.escape(filename), message)
+
         if m:
-            line_no, error_message = m.groups()
-            line_no = int(line_no)
-            line_contents = text.splitlines()[int(line_no)-1].rstrip()
-            r.description = error_message
-            r.lineStart = r.lineEnd = line_no
+            r.description = m.group('message')
+            r.lineStart = r.lineEnd = int(m.group('line_no'))
+            line_contents = text.splitlines()[r.lineStart - 1].rstrip()
             r.columnStart = len(line_contents) - len(line_contents.strip()) + 1
             r.columnEnd = len(line_contents) + 1
 
+        log.debug("Result: [%s]", r)
+        return r
+
+    def _build_error_result(self, text, message, filename):
+        # Example message:  hello.go:5:5: import "appengine/datastore": cannot find package
+        r = KoLintResult()
+        r.severity = r.SEV_ERROR
+        m = re.match('%s:(?P<line_no>\d+):(?P<col_no>\d+): (?P<message>.*)' % re.escape(filename), message)
+
+        if m:
+            r.description = m.group('message')
+            r.lineStart = r.lineEnd = int(m.group('line_no'))
+            r.columnStart = int(m.group('col_no'))
+            r.columnEnd = len(text.splitlines()[r.lineStart - 1].rstrip())
+
+        log.debug("Result: [%s]", r)
         return r
